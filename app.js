@@ -213,13 +213,16 @@
   function toast(msg, action) {
     const t = $('#toast');
     t.innerHTML = `<img class="ti" src="local-icon-192.png" alt=""><span class="tx"><span class="tn">账号星图</span><span class="tt">${esc(msg)}</span></span>${action ? `<button>${esc(action.label)}</button>` : ''}`;
-    if (action) t.querySelector('button').onclick = () => { action.fn(); t.classList.remove('show'); };
+    if (action) t.querySelector('button').onclick = () => { t.classList.remove('show'); action.fn(); };
     t.classList.add('show');
     clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), action ? 4500 : 2200);
   }
   let undoSnap = null;
   const snap = () => { undoSnap = JSON.stringify(state); };
-  const undoToast = msg => toast(msg, { label: '撤销', fn: () => { state = JSON.parse(undoSnap); save(); render(); } });
+  const undoToast = (msg, committed) => toast(msg, { label: '撤销', fn: () => {
+    if (committed !== undefined && localStorage.getItem(KEY) !== committed) return toast('本机记录有更新，无法撤销此次导入');
+    state = JSON.parse(undoSnap); save(); render();
+  } });
 
   // ---------- wallet card ----------
   function walletCard(i, extra = '', carrierValue = i.value) {
@@ -1067,28 +1070,167 @@
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `账号备份-${new Date().toISOString().slice(0, 10)}.json`; a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1500); toast('备份已导出');
   }
-  function importData(file) {
-    const r = new FileReader();
-    r.onload = () => {
-      let data;
-      try {
-        data = JSON.parse(r.result);
-        const validId = id => typeof id === 'string' && /^[\w.-]+$/.test(id);
-        const strings = (record, keys) => keys.every(key => record[key] == null || typeof record[key] === 'string');
-        if (!Array.isArray(data.identities) || !Array.isArray(data.accounts) ||
-            !data.identities.every(i => i && validId(i.id) && ['email', 'phone'].includes(i.type) && typeof i.value === 'string' &&
-              /^#[\da-f]{3,8}$/i.test(i.color) && strings(i, ['label', 'notes', 'store', 'cardRole', 'plan', 'broadband', 'device', 'mainCardId'])) ||
-            !data.accounts.every(a => a && validId(a.id) && typeof a.name === 'string' && Array.isArray(a.identityIds) && a.identityIds.every(validId) &&
-              strings(a, ['domain', 'category', 'handle', 'notes']))) throw new Error('Invalid Atlas backup');
-      } catch { toast('这不是有效的 Atlas 备份文件'); return; }
-      const previous = state;
-      snap();
-      state = { identities: data.identities, accounts: data.accounts };
-      try { save(); } catch { state = previous; remember(); toast('无法保存导入的记录'); return; }
-      render();
-      undoToast(`已导入 ${data.identities.length} 个身份和 ${data.accounts.length} 个网站`);
+  function validateImport(data) {
+    const validId = id => typeof id === 'string' && /^[\w.-]+$/.test(id);
+    const strings = (record, keys) => keys.every(key => record[key] == null || typeof record[key] === 'string');
+    if (!Array.isArray(data?.identities) || !Array.isArray(data.accounts) ||
+        !data.identities.every(i => i && validId(i.id) && ['email', 'phone'].includes(i.type) && typeof i.value === 'string' && i.value.trim() &&
+          typeof i.color === 'string' && /^#[\da-f]{3,8}$/i.test(i.color) && strings(i, ['label', 'notes', 'store', 'cardRole', 'plan', 'broadband', 'device', 'mainCardId', 'carrierOverride'])) ||
+        !data.accounts.every(a => a && validId(a.id) && typeof a.name === 'string' && Array.isArray(a.identityIds) && a.identityIds.every(validId) &&
+          strings(a, ['domain', 'category', 'handle', 'notes']))) throw new Error('Invalid Atlas backup');
+    const ids = [...data.identities, ...data.accounts].map(record => record.id);
+    if (new Set(ids).size !== ids.length) throw new Error('Duplicate record IDs in backup');
+    const importedAt = Date.now();
+    for (const account of data.accounts) {
+      const date = account.createdAt ? new Date(account.createdAt).getTime() : NaN;
+      account.createdAt = Number.isFinite(date) ? date : importedAt;
+    }
+    return data;
+  }
+
+  function mergeImport(base, data) {
+    const next = structuredClone(base);
+    const used = new Set([...next.identities, ...next.accounts].map(record => record.id));
+    const uniqueId = preferred => {
+      let id = preferred;
+      while (used.has(id)) id = uid();
+      used.add(id);
+      return id;
     };
-    r.readAsText(file);
+    const byIdentity = new Map();
+    const byId = new Map(next.identities.map(i => [i.id, i]));
+    const incomingIds = new Map(), added = new Set(), updated = new Set();
+    const text = value => String(value ?? '').trim().toLowerCase();
+    const identityKey = i => i.type + ':' + (i.type === 'phone' ? phoneKey(i.value) : text(i.value));
+    const accountKey = a => JSON.stringify([text(a.name), text(a.handle)]);
+    for (const identity of next.identities) {
+      const key = identityKey(identity);
+      if (!byIdentity.has(key)) byIdentity.set(key, identity);
+    }
+    const fillBlanks = (target, source, fields) => {
+      for (const field of fields) {
+        if (!text(target[field]) && text(source[field])) {
+          target[field] = source[field];
+          if (!added.has(target.id)) updated.add(target.id);
+        }
+      }
+    };
+    for (const source of data.identities) {
+      const key = identityKey(source);
+      const sameId = byId.get(source.id);
+      let target = sameId?.type === source.type ? sameId : byIdentity.get(key);
+      if (target) {
+        fillBlanks(target, source, ['label', 'notes', 'carrierOverride', 'store', 'cardRole', 'plan', 'broadband', 'device']);
+      } else {
+        const { mainCardId, ...fields } = source;
+        target = { ...fields, id: uniqueId(source.id) };
+        added.add(target.id);
+        next.identities.push(target);
+        byId.set(target.id, target);
+        byIdentity.set(key, target);
+      }
+      incomingIds.set(source.id, target.id);
+    }
+    const findIdentity = id => incomingIds.get(id) ?? (byId.has(id) ? id : undefined);
+    for (const source of data.identities) {
+      const target = byId.get(incomingIds.get(source.id));
+      const main = byId.get(findIdentity(source.mainCardId));
+      if (target.type === 'phone' && target.cardRole === '副卡' && !target.mainCardId &&
+          main?.type === 'phone' && main.cardRole === '主卡' && main !== target) {
+        target.mainCardId = main.id;
+        if (!added.has(target.id)) updated.add(target.id);
+      }
+    }
+
+    const groups = new Map();
+    const groupFor = a => {
+      const key = accountKey(a);
+      if (!groups.has(key)) groups.set(key, []);
+      return groups.get(key);
+    };
+    for (const account of next.accounts) groupFor(account).push(account);
+    const existingById = new Map(next.accounts.map(account => [account.id, account]));
+    const sourceAccountIds = new Set(data.accounts.map(account => account.id));
+    const consumed = new Set();
+    for (const source of data.accounts) {
+      const links = [...new Set(source.identityIds.map(findIdentity).filter(Boolean))];
+      const candidates = text(source.handle) ? groupFor(source) : [];
+      const overlapping = candidates.filter(a => !sourceAccountIds.has(a.id) && !consumed.has(a.id) &&
+        (links.some(id => a.identityIds.includes(id)) || !links.length && !a.identityIds.length));
+      const target = existingById.get(source.id) ?? (overlapping.length === 1 ? overlapping[0] : null);
+      if (target) {
+        consumed.add(target.id);
+        fillBlanks(target, source, ['domain', 'category', 'notes', 'createdAt']);
+        const missing = links.filter(id => !target.identityIds.includes(id));
+        if (missing.length) {
+          target.identityIds.push(...missing);
+          if (!added.has(target.id)) updated.add(target.id);
+        }
+      } else {
+        const account = { ...source, id: uniqueId(source.id), identityIds: links };
+        added.add(account.id);
+        next.accounts.push(account);
+      }
+    }
+    return { next, added: added.size, updated: updated.size };
+  }
+
+  const importIsLocal = () => !Sync.on && !Sync.running && !localStorage.getItem('atlas.sync');
+
+  function previewImport(data) {
+    if (!importIsLocal()) return toast('请先关闭加密同步，再进行本机导入');
+    const raw = localStorage.getItem(KEY);
+    let base, preview;
+    try {
+      base = raw === null ? state : JSON.parse(raw);
+      preview = mergeImport(base, data);
+    } catch { toast('无法读取本机记录，请刷新后再导入'); return; }
+    const { next, added, updated } = preview;
+    const existing = base.identities.length + base.accounts.length;
+    const total = data.identities.length + data.accounts.length;
+    function commitImport(result) {
+      if (!importIsLocal()) return toast('请先关闭加密同步，再进行本机导入');
+      if (localStorage.getItem(KEY) !== raw) return toast('本机记录有更新，请重新选择文件');
+      const previous = state;
+      state = base;
+      remember();
+      snap();
+      state = result;
+      try { save(); } catch { state = previous; remember(); toast('无法保存导入的记录'); return; }
+      if (state.identities.length && !state.identities.some(i => i.type === ui.kind)) setKind(state.identities[0].type);
+      ui.active = Math.min(ui.active, deck().length);
+      closeSheet();
+      render();
+      undoToast('已导入到本机', localStorage.getItem(KEY));
+    }
+    openSheet(`${bar('取消', '批量导入', '合并导入', `id="mergeImport" ${added || updated ? '' : 'disabled'}`)}
+      <div class="sheet-body">
+        <div class="alert"><h3>${data.identities.length} 个身份 · ${data.accounts.length} 个网站与 App</h3>
+          <p>${added || updated ? `新增 ${added} 条，补全 ${updated} 条。已有内容会保留。` : total ? '这些记录已在本机。' : '文件里没有记录。'}</p></div>
+        ${existing ? '<div class="alert-actions"><button class="destructive" id="restoreImport">替换本机记录…</button></div>' : ''}
+      </div>`, { kind: 'import' });
+    $('#mergeImport').onclick = () => commitImport(next);
+    const restore = $('#restoreImport');
+    if (restore) restore.onclick = () => {
+      const ids = new Set(data.identities.map(i => i.id));
+      if (data.identities.some(i => i.mainCardId && !ids.has(i.mainCardId)) ||
+          data.accounts.some(a => a.identityIds.some(id => !ids.has(id)))) return toast('备份缺少关联的号码或邮箱，无法替换');
+      confirmSheet('替换本机记录？', '当前的本机记录会由这个文件全部替换。', '确认替换', () => {
+        commitImport({ ...base, deleted: { ...base.deleted }, identities: data.identities, accounts: data.accounts });
+      });
+    };
+  }
+
+  function importData(file) {
+    const reader = new FileReader();
+    reader.onerror = () => toast('无法读取这个文件');
+    reader.onload = () => {
+      let data;
+      try { data = validateImport(JSON.parse(reader.result.replace(/^\uFEFF/, ''))); }
+      catch { toast('这不是有效的 Atlas 备份文件'); return; }
+      previewImport(data);
+    };
+    reader.readAsText(file);
   }
 
   // ---------- events ----------
@@ -1355,7 +1497,7 @@
     const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
     const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
     let conf = (() => { try { return JSON.parse(localStorage.getItem(CONF)); } catch { return null; } })();
-    let key = null, timer = null, busy = false, again = false;
+    let key = null, timer = null, busy = false, again = false, enabling = false;
     const status = { state: conf ? 'idle' : 'off', at: conf?.at || 0, err: '' };
     const listeners = new Set(); const emit = () => listeners.forEach(f => f());
 
@@ -1444,7 +1586,7 @@
     }
 
     return {
-      get on() { return !!conf; }, status, listeners,
+      get on() { return !!conf; }, get running() { return busy || enabling; }, status, listeners,
       async init() {
         if (!conf) return;
         try { key = await crypto.subtle.importKey('raw', unb64(conf.key), 'AES-GCM', true, ['encrypt', 'decrypt']); run(); }
@@ -1456,33 +1598,40 @@
       now: run,
       get provider() { return conf?.provider || 'github'; },
       async enable(token, pass, prov = 'gitee') {
-        token = token.trim();
-        const gists = await gh('/gists?per_page=100', {}, token, prov);
-        let g = gists.find(x => x.files && x.files[FILE]);
-        let salt;
-        if (g) {
-          const text = await readGist(g.id, token, prov); const box = JSON.parse(text);
-          salt = box.salt;
-          const k = await derive(pass, unb64(salt));
-          try { await open(text, k); } catch { throw new Error('同步密码不对（和第一次设置的不一样）'); }
-          key = k;
-        } else {
-          salt = b64(crypto.getRandomValues(new Uint8Array(16)));
-          key = await derive(pass, unb64(salt));
-        }
-        conf = { provider: prov, token, salt, key: b64(await crypto.subtle.exportKey('raw', key)), gistId: g ? g.id : null, at: 0 };
-        if (!g) {
-          const made = await gh('/gists', { method: 'POST', body: JSON.stringify({ description: DESC, public: false, files: { [FILE]: { content: await seal(state) } } }) }, token, prov);
-          conf.gistId = made.id;
-        }
-        localStorage.setItem(CONF, JSON.stringify(conf));
-        status.state = 'idle'; emit();
-        document.addEventListener('visibilitychange', () => { if (!document.hidden) run(); });
-        await run(); render();
-        return !!g;
+        if (enabling) throw new Error('正在连接加密同步');
+        enabling = true;
+        try { return await connectSync(token, pass, prov); }
+        finally { enabling = false; }
       },
       disable() { conf = null; key = null; localStorage.removeItem(CONF); status.state = 'off'; emit(); },
     };
+
+    async function connectSync(token, pass, prov) {
+      token = token.trim();
+      const gists = await gh('/gists?per_page=100', {}, token, prov);
+      let g = gists.find(x => x.files && x.files[FILE]);
+      let salt;
+      if (g) {
+        const text = await readGist(g.id, token, prov); const box = JSON.parse(text);
+        salt = box.salt;
+        const k = await derive(pass, unb64(salt));
+        try { await open(text, k); } catch { throw new Error('同步密码不对（和第一次设置的不一样）'); }
+        key = k;
+      } else {
+        salt = b64(crypto.getRandomValues(new Uint8Array(16)));
+        key = await derive(pass, unb64(salt));
+      }
+      conf = { provider: prov, token, salt, key: b64(await crypto.subtle.exportKey('raw', key)), gistId: g ? g.id : null, at: 0 };
+      if (!g) {
+        const made = await gh('/gists', { method: 'POST', body: JSON.stringify({ description: DESC, public: false, files: { [FILE]: { content: await seal(state) } } }) }, token, prov);
+        conf.gistId = made.id;
+      }
+      localStorage.setItem(CONF, JSON.stringify(conf));
+      status.state = 'idle'; emit();
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) run(); });
+      await run(); render();
+      return !!g;
+    }
   })();
 
   const ago = t => { if (!t) return ''; const s = (Date.now() - t) / 1e3; return s < 60 ? '刚刚' : s < 3600 ? Math.floor(s / 60) + ' 分钟前' : s < 86400 ? Math.floor(s / 3600) + ' 小时前' : new Date(t).toLocaleDateString('zh-CN'); };
